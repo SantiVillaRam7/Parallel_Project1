@@ -1,15 +1,8 @@
-// omp2.cpp — DBSCAN Paralelo (Versión 2: optimizada)
-// Optimiza con grilla espacial (tiling) + DSU (union-find) para unir SOLO cores.
-// Explicación: 
-// 1) Indexamos puntos en celdas de lado eps (usando x[0], x[1] como clave espacial) y
-//    consultamos solo la celda y sus 8 vecinas. Distancia Euclidiana completa para filtrar.
-// 2) Marcamos CORE en paralelo.
-// 3) Unimos pares CORE-CORE vecinos con DSU (sección crítica pequeña en unite()).
-// 4) Etiquetamos BORDER heredando la etiqueta de cualquier core vecino.
+// omp2.cpp — DBSCAN Paralelo (Versión 2 optimizada con grilla + DSU, soporte CSV)
 // Compilar:
-//   /opt/homebrew/bin/g++-14 -O3 -std=c++17 -fopenmp omp2.cpp -o omp2
+//   /opt/homebrew/bin/g++-15 -O3 -std=c++17 -fopenmp omp2.cpp -o omp2
 // Ejecutar:
-//   ./omp2 --threads 8 --n 50000 --d 2 --eps 1.5 --minpts 8 --seed 42
+//   ./omp2 --threads 8 --in 4000_data.csv --eps 0.03 --minpts 10 --out 4000_results.csv
 
 #include <vector>
 #include <queue>
@@ -17,6 +10,8 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <random>
 #include <unordered_map>
 #include <omp.h>
@@ -25,9 +20,7 @@ using namespace std;
 
 // ------------------------------- Tipos básicos ---------------------------------
 struct Point { vector<double> x; };
-
 struct Params { double eps; int minPts; };
-
 struct Result {
   vector<int> label;        // -1 (interno), -2 noise, >=0 cluster
   vector<uint8_t> is_core;  // 1 si core, 0 no-core
@@ -65,24 +58,20 @@ struct DSU {
 struct CellKey { long long x, y; };
 struct CellKeyHash{
   size_t operator()(const CellKey& k) const noexcept {
-    // Mezcla simple para 64 bits -> size_t
     return std::hash<long long>{}((k.x<<32) ^ (k.y & 0xffffffff));
   }
 };
 struct CellKeyEq{ bool operator()(const CellKey& a, const CellKey& b) const noexcept { return a.x==b.x && a.y==b.y; } };
 
-// ------------------------------- OMP2 DBSCAN -----------------------------------
+// ------------------------------- DBSCAN OMP2 -----------------------------------
 Result dbscan_omp2(const vector<Point>& P, const Params& param, int threads){
   omp_set_num_threads(threads);
   const int n = (int)P.size();
   const double eps = param.eps; const double eps2 = eps*eps;
-  const int dim = (int)P[0].x.size(); (void)dim; // usamos dist2 para todas las dims
 
   const int T = omp_get_max_threads();
 
   auto cell_of = [&](const Point& p){
-    // Clave espacial usando las dos primeras dimensiones; válido para d>=2.
-    // Para d==1, la segunda coord se toma 0.
     double x0 = p.x.size()>=1 ? p.x[0] : 0.0;
     double x1 = p.x.size()>=2 ? p.x[1] : 0.0;
     long long cx = (long long)floor(x0/eps);
@@ -133,7 +122,7 @@ Result dbscan_omp2(const vector<Point>& P, const Params& param, int threads){
     return false;
   };
 
-  // 2) CORE en paralelo y 3) recolección de aristas CORE-CORE en una sola región
+  // 2) CORE en paralelo y 3) recolección de aristas CORE-CORE
   vector<uint8_t> is_core(n,0);
   vector<vector<pair<int,int>>> edges_local(T);
   for(auto &v : edges_local) v.reserve(1024);
@@ -143,13 +132,11 @@ Result dbscan_omp2(const vector<Point>& P, const Params& param, int threads){
     int tid = omp_get_thread_num();
     vector<int> buf; buf.reserve(64);
 
-    // 2) CORE con corte temprano, schedule static
     #pragma omp for schedule(static)
     for(int i=0;i<n;i++){
       if (count_neighbors_ge_min(i, param.minPts)) is_core[i]=1;
     }
 
-    // 3) Recolectar pares CORE-CORE (j>i) con schedule static
     #pragma omp for schedule(static)
     for(int i=0;i<n;i++){
       if (!is_core[i]) continue;
@@ -181,7 +168,7 @@ Result dbscan_omp2(const vector<Point>& P, const Params& param, int threads){
   // 5) BORDER: hereda la etiqueta de cualquier core vecino
   #pragma omp parallel for schedule(static)
   for(int i=0;i<n;i++){
-    if (R.is_core[i]) continue; // ya etiquetado
+    if (R.is_core[i]) continue;
     vector<int> buf; buf.reserve(64);
     neighbors_in_bins(i, buf);
     for(int j: buf){ if (R.is_core[j]) { R.label[i] = R.label[j]; break; } }
@@ -190,7 +177,31 @@ Result dbscan_omp2(const vector<Point>& P, const Params& param, int threads){
   R.n_clusters = cid; compute_counts(R); return R;
 }
 
-// ------------------------------- Dataset sintético ------------------------------
+// ------------------------------- I/O helpers -----------------------------------
+static vector<Point> read_csv_points(const string& filename){
+  ifstream in(filename);
+  vector<Point> P;
+  string line;
+  while (getline(in, line)){
+    stringstream ss(line);
+    Point p; double val; char c;
+    while (ss >> val){
+      p.x.push_back(val);
+      ss >> c;
+    }
+    if(!p.x.empty()) P.push_back(p);
+  }
+  return P;
+}
+
+static void write_csv_results(const string& filename, const vector<Point>& P, const Result& R){
+  ofstream out(filename);
+  for(size_t i=0;i<P.size();++i){
+    int lbl = (R.label[i] == -2 ? 0 : 1);
+    out << P[i].x[0] << "," << P[i].x[1] << "," << lbl << "\n";
+  }
+}
+
 static vector<Point> make_synthetic(int n, int d, unsigned seed){
   mt19937 rng(seed);
   normal_distribution<double> g1(0.0, 1.0), g2(6.0, 1.0);
@@ -204,22 +215,26 @@ static vector<Point> make_synthetic(int n, int d, unsigned seed){
 
 // ------------------------------------ main -------------------------------------
 int main(int argc, char** argv){
-  int threads = 8;           // por defecto
-  int n = 30000, d = 2;      // tamaño y dimensión del dataset
-  double eps = 1.5;          // radio
-  int minPts = 8;            // densidad mínima
-  unsigned seed = 42;        // reproducibilidad
+  int threads = 8;
+  int n = 30000, d = 2;
+  double eps = 1.5;
+  int minPts = 8;
+  unsigned seed = 42;
+  string in_file = "", out_file = "";
 
   for (int i=1; i<argc; ++i){
-    if (string(argv[i])=="--threads" && i+1<argc) threads = stoi(argv[++i]);
-    else if (string(argv[i])=="--n" && i+1<argc) n = stoi(argv[++i]);
-    else if (string(argv[i])=="--d" && i+1<argc) d = stoi(argv[++i]);
-    else if (string(argv[i])=="--eps" && i+1<argc) eps = stod(argv[++i]);
-    else if (string(argv[i])=="--minpts" && i+1<argc) minPts = stoi(argv[++i]);
-    else if (string(argv[i])=="--seed" && i+1<argc) seed = (unsigned)stoul(argv[++i]);
+    string a = argv[i];
+    if (a=="--threads" && i+1<argc) threads = stoi(argv[++i]);
+    else if (a=="--n" && i+1<argc) n = stoi(argv[++i]);
+    else if (a=="--d" && i+1<argc) d = stoi(argv[++i]);
+    else if (a=="--eps" && i+1<argc) eps = stod(argv[++i]);
+    else if (a=="--minpts" && i+1<argc) minPts = stoi(argv[++i]);
+    else if (a=="--seed" && i+1<argc) seed = (unsigned)stoul(argv[++i]);
+    else if (a=="--in" && i+1<argc) in_file = argv[++i];
+    else if (a=="--out" && i+1<argc) out_file = argv[++i];
   }
 
-  auto P = make_synthetic(n, d, seed);
+  vector<Point> P = in_file.empty() ? make_synthetic(n,d,seed) : read_csv_points(in_file);
   Params param{eps, minPts};
 
   double t0 = omp_get_wtime();
@@ -235,5 +250,6 @@ int main(int argc, char** argv){
        << " border=" << R.n_border
        << " noise=" << R.n_noise << "\n";
 
+  if(!out_file.empty()) write_csv_results(out_file, P, R);
   return 0;
 }

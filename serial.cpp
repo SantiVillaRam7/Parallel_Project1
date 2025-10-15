@@ -1,10 +1,8 @@
-
-
-// serial.cpp — Implementación serial de DBSCAN (oráculo de correctitud)
-// Programa standalone: compila y corre sin más archivos.
+// serial.cpp — Implementación serial de DBSCAN (actualizado con soporte CSV)
+// Compilar:
+//   /opt/homebrew/bin/g++-15 -O3 -std=c++17 -fopenmp serial.cpp -o serial
 // Ejemplo:
-//   g++ -O3 -std=c++17 -fopenmp serial.cpp -o dbscan_serial
-//   ./dbscan_serial --n 50000 --d 2 --eps 1.5 --minpts 8 --seed 42
+//   ./serial --in 4000_data.csv --eps 0.03 --minpts 10 --out 4000_results.csv
 
 #include <vector>
 #include <queue>
@@ -12,6 +10,8 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <random>
 #include <chrono>
 #include <omp.h>
@@ -20,9 +20,7 @@ using namespace std;
 
 // ------------------------------- Tipos básicos ---------------------------------
 struct Point { vector<double> x; };
-
 struct Params { double eps; int minPts; };
-
 struct Result {
   vector<int> label;        // -1 (interno), -2 noise, >=0 cluster
   vector<uint8_t> is_core;  // 1 si core, 0 no-core
@@ -50,7 +48,6 @@ Result dbscan_serial(const vector<Point>& P, const Params& param){
   const double eps2 = param.eps * param.eps;
   Result R; R.label.assign(n, -1); R.is_core.assign(n, 0);
 
-  // 1) Precomputar vecindarios (naive O(n^2))
   vector<vector<int>> neigh(n);
   for(int i=0;i<n;i++){
     neigh[i].reserve(64);
@@ -60,22 +57,20 @@ Result dbscan_serial(const vector<Point>& P, const Params& param){
     if ((int)neigh[i].size() >= param.minPts) R.is_core[i]=1;
   }
 
-  // 2) Expandir clusters (BFS) desde puntos core; border hereda etiqueta
   int cid=0; queue<int> q;
   for(int i=0;i<n;i++){
-    if (R.label[i] != -1) continue;            // ya visitado/etiquetado
-    if (!R.is_core[i]) { R.label[i] = -2; continue; } // provisional noise si no es core
+    if (R.label[i] != -1) continue;
+    if (!R.is_core[i]) { R.label[i] = -2; continue; }
 
-    // Nueva componente (cluster) a partir de un core
     R.label[i]=cid; q.push(i);
     while(!q.empty()){
       int u=q.front(); q.pop();
-      if (!R.is_core[u]) continue; // sólo los core expanden
+      if (!R.is_core[u]) continue;
       for(int v : neigh[u]){
-        if (R.label[v] == -2) R.label[v] = cid; // era noise → ahora border del cluster
-        if (R.label[v] == -1){                 // no visitado
-          R.label[v] = cid;                    // asigna al cluster
-          if (R.is_core[v]) q.push(v);         // sólo los core propagan
+        if (R.label[v] == -2) R.label[v] = cid;
+        if (R.label[v] == -1){
+          R.label[v] = cid;
+          if (R.is_core[v]) q.push(v);
         }
       }
     }
@@ -87,7 +82,31 @@ Result dbscan_serial(const vector<Point>& P, const Params& param){
   return R;
 }
 
-// ------------------------------- Dataset sintético ------------------------------
+// ------------------------------- I/O helpers -----------------------------------
+static vector<Point> read_csv_points(const string& filename){
+  ifstream in(filename);
+  vector<Point> P;
+  string line;
+  while (getline(in, line)){
+    stringstream ss(line);
+    Point p; double val; char c;
+    while (ss >> val){
+      p.x.push_back(val);
+      ss >> c;
+    }
+    if(!p.x.empty()) P.push_back(p);
+  }
+  return P;
+}
+
+static void write_csv_results(const string& filename, const vector<Point>& P, const Result& R){
+  ofstream out(filename);
+  for(size_t i=0;i<P.size();++i){
+    int lbl = (R.label[i] == -2 ? 0 : 1);
+    out << P[i].x[0] << "," << P[i].x[1] << "," << lbl << "\n";
+  }
+}
+
 static vector<Point> make_synthetic(int n, int d, unsigned seed){
   mt19937 rng(seed);
   normal_distribution<double> g1(0.0, 1.0), g2(6.0, 1.0);
@@ -101,22 +120,24 @@ static vector<Point> make_synthetic(int n, int d, unsigned seed){
 
 // ------------------------------------ main -------------------------------------
 int main(int argc, char** argv){
-  // Parámetros por defecto
-  int n = 30000, d = 2;      // tamaño y dimensión del dataset
-  double eps = 1.5;          // radio
-  int minPts = 8;            // densidad mínima
-  unsigned seed = 42;        // reproducibilidad
+  int n = 30000, d = 2;
+  double eps = 1.5;
+  int minPts = 8;
+  unsigned seed = 42;
+  string in_file = "", out_file = "";
 
-  // CLI sencilla al estilo de los ejemplos del curso
   for (int i=1; i<argc; ++i){
-    if (string(argv[i])=="--n" && i+1<argc) n = stoi(argv[++i]);
-    else if (string(argv[i])=="--d" && i+1<argc) d = stoi(argv[++i]);
-    else if (string(argv[i])=="--eps" && i+1<argc) eps = stod(argv[++i]);
-    else if (string(argv[i])=="--minpts" && i+1<argc) minPts = stoi(argv[++i]);
-    else if (string(argv[i])=="--seed" && i+1<argc) seed = (unsigned)stoul(argv[++i]);
+    string a = argv[i];
+    if (a=="--n" && i+1<argc) n = stoi(argv[++i]);
+    else if (a=="--d" && i+1<argc) d = stoi(argv[++i]);
+    else if (a=="--eps" && i+1<argc) eps = stod(argv[++i]);
+    else if (a=="--minpts" && i+1<argc) minPts = stoi(argv[++i]);
+    else if (a=="--seed" && i+1<argc) seed = (unsigned)stoul(argv[++i]);
+    else if (a=="--in" && i+1<argc) in_file = argv[++i];
+    else if (a=="--out" && i+1<argc) out_file = argv[++i];
   }
 
-  auto P = make_synthetic(n, d, seed);
+  vector<Point> P = in_file.empty() ? make_synthetic(n,d,seed) : read_csv_points(in_file);
   Params param{eps, minPts};
 
   double t0 = omp_get_wtime();
@@ -131,5 +152,6 @@ int main(int argc, char** argv){
        << " border=" << R.n_border
        << " noise=" << R.n_noise << "\n";
 
+  if(!out_file.empty()) write_csv_results(out_file, P, R);
   return 0;
 }
