@@ -1,3 +1,0 @@
-impl=omp1 threads=4 n=30000 d=2 eps=0.03 minPts=10
-time_s=0.436556
-clusters=300 core=1335 border=3344 noise=25321
